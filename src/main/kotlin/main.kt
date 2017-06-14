@@ -4,30 +4,30 @@ import kotlinx.coroutines.experimental.delay
 import kotlinx.coroutines.experimental.launch
 import kotlinx.coroutines.experimental.selects.select
 import java.util.*
-import javax.security.auth.login.FailedLoginException
-import kotlin.concurrent.fixedRateTimer
 
 class PoolEntry<T>(val value: T, var lastUsed: Date = Date()) : AutoCloseable {
     override fun close() {
-        try {
-            if (value is AutoCloseable) value.close()
-        } catch (_: Throwable) {
-        }
+        if (value is AutoCloseable)
+            try {
+                value.close()
+            } catch (_: Throwable) {
+            }
     }
 }
 
-sealed class Result<T>
-data class Ok<T>(val value: T) : Result<T>()
-data class Err<T>(val error: Throwable) : Result<T>()
-
-class ObjectPool<T>(createNew: () -> T, capacity: Int = 50, private val inactiveTimeBeforeDispose: Long) {
-    val reqCh = Channel<Pair<Channel<Unit>, Channel<Result<PoolEntry<T>>>>>()
+class ObjectPool<T>(createNew: () -> T, capacity: Int = 50, private val inactiveTimeBeforeDisposeMillis: Long) {
+    val reqCh = Channel<Channel<PoolEntry<T>>>()
     val releaseCh = Channel<PoolEntry<T>>()
     val maybeExpiredCh = Channel<PoolEntry<T>>()
     val doDispose = Channel<Unit>()
-    val hasDisposed = Channel<Boolean>()
+    val hasDisposed = Channel<Unit>()
     val available = Stack<PoolEntry<T>>()
     var given = 0
+
+    private fun <T> Stack<T>.tryPop() = if (empty()) null else pop()
+    private fun <T> close(x: T) {
+        if (x is AutoCloseable) x.close()
+    }
 
     init {
         launch(CommonPool) {
@@ -37,35 +37,33 @@ class ObjectPool<T>(createNew: () -> T, capacity: Int = 50, private val inactive
                     releaseCh.onReceive { instance ->
                         instance.lastUsed = Date()
                         launch(CommonPool) {
-                            delay(inactiveTimeBeforeDispose)
+                            delay(inactiveTimeBeforeDisposeMillis)
                             maybeExpiredCh.send(instance)
                         }
                         available.add(instance)
                         given--
                     }
-                    //// request for an instance
-                    reqCh.onReceive { (nack, replyCh) ->
-                        if (available.empty()) {
-                            try {
-                                val instance = PoolEntry(createNew())
-                                select<Unit> {
-                                    replyCh.onSend(Ok(instance)) { given++ }
-                                    nack.onSend(Unit) { available.add(instance) }
-                                }
-
-                            } catch (e : Throwable) {
-                                select<Unit> {
-                                    replyCh.onSend(Err(e)) {}
-                                    nack.onSend(Unit) {}
-                                }
-                            }
+                    // if number of given objects has not reached the capacity, synchronize on request channel as well
+                    if (given < capacity)
+                    // request for an instance
+                        reqCh.onReceive { replyCh ->
+                            replyCh.send(available.tryPop() ?: PoolEntry(createNew()))
+                            given++
                         }
-                        else {
-                            val instance = available.pop()
-                            select {
-                                replyCh.onSend(Ok(instance)) { given++ }
-                                nack.onSend(Unit) { available.add(instance) }
-                            }
+                    // an instance was inactive for too long
+                    maybeExpiredCh.onReceive { instance ->
+                        if (Date().time - instance.lastUsed.time > inactiveTimeBeforeDisposeMillis
+                            && available.any { it === instance }) {
+                            close(instance)
+                            available.removeIf { it === instance }
+                        }
+                        // the entire pool is disposing
+                        doDispose.onReceive {
+                            // dispose all instances that are in pool
+                            available.forEach { close(it) }
+                            // wait until all given instances are returned to the pool and disposing them on the way
+                            (1..given).forEach { close(releaseCh.receive()) }
+                            hasDisposed.send(Unit)
                         }
                     }
                 }
@@ -73,33 +71,11 @@ class ObjectPool<T>(createNew: () -> T, capacity: Int = 50, private val inactive
         }
     }
 
-//// an instance was inactive for too long
-//let expiredAlt() =
-//maybeExpiredCh ^=> fun instance ->
-//if DateTime.UtcNow - instance.LastUsed > inactiveTimeBeforeDispose
-//&& List.exists (fun x -> obj.ReferenceEquals(x, instance)) available then
-//dispose instance
-//loop (available |> List.filter (fun x -> not <| obj.ReferenceEquals(x, instance)), given)
-//else loop (available, given)
-//
-//// the entire pool is disposing
-//let disposeAlt() =
-//doDispose ^=> fun _ ->
-//// dispose all instances that are in pool
-//available |> List.iter dispose
-//// wait until all given instances are returns to pool and disposing them on the way
-//Job.forN (int given) (releaseCh >>- dispose) >>=. hasDisposed *<= ()
-//
-//if given < capacity then
-//// if number of given objects has not reached the capacity, synchronize on request channel as well
-//releaseAlt() <|> expiredAlt() <|> disposeAlt() <|> reqAlt()
-//else
-//releaseAlt() <|> expiredAlt() <|> disposeAlt()
-//
-//do start (loop ([], 0u))
-}
-//
-//let get() = reqCh *<+->- fun replyCh nack -> (nack, replyCh)
+    suspend fun get() : T {
+        val replyCh = Channel<PoolEntry<T>>()
+        reqCh.send(replyCh)
+        return replyCh.receive().value
+    }
 //
 ///// Applies a function, that returns a Job, on an instance from pool. Returns `Alt` to consume
 ///// the function result.
@@ -130,3 +106,4 @@ class ObjectPool<T>(createNew: () -> T, capacity: Int = 50, private val inactive
 ///// Applies a function on an instance from pool, synchronously, in the thread in which it's called.
 ///// Warning! Can deadlock being called from application main thread.
 //member x.WithInstanceSync f = x.WithInstance f |> run
+}
